@@ -1,0 +1,11 @@
+flask
+flask-cors
+flask-bcrypt
+flask-jwt-extended
+scikit-learn
+joblib
+numpy
+psycopg2-binary
+newspaper3k
+lxml_html_clean
+gunicorn
