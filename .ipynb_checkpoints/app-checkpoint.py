@@ -31,6 +31,15 @@ def get_db_connection():
     sslmode = 'require' if DB_CONFIG['host'] != 'localhost' else 'prefer'
     return psycopg2.connect(**DB_CONFIG, sslmode=sslmode)
 
+def require_admin(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+    return user and user['role'] == 'admin'
+
 
 def clean_text(text):
     text = str(text)
@@ -95,7 +104,7 @@ def login():
         return jsonify({'error': 'Invalid username or password'}), 401
 
     token = create_access_token(identity=str(user['id']))
-    return jsonify({'token': token, 'username': user['username']})
+    return jsonify({'token': token, 'username': user['username'], 'role': user['role']})
 
 
 @app.route('/predict', methods=['POST'])
@@ -218,6 +227,78 @@ def delete_check(check_id):
 
     if deleted == 0:
         return jsonify({'error': 'Not found'}), 404
+
+    return jsonify({'success': True})
+
+@app.route('/admin/users', methods=['GET'])
+@jwt_required()
+def admin_list_users():
+    user_id = get_jwt_identity()
+    if not require_admin(user_id):
+        return jsonify({'error': 'Admin access required'}), 403
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute(
+        """SELECT u.id, u.username, u.role, u.created_at,
+                  COUNT(c.id) as check_count
+           FROM users u
+           LEFT JOIN checks c ON c.user_id = u.id
+           GROUP BY u.id
+           ORDER BY u.created_at DESC"""
+    )
+    users = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    for u in users:
+        u['created_at'] = u['created_at'].isoformat()
+
+    return jsonify(users)
+
+
+@app.route('/admin/checks', methods=['GET'])
+@jwt_required()
+def admin_list_checks():
+    user_id = get_jwt_identity()
+    if not require_admin(user_id):
+        return jsonify({'error': 'Admin access required'}), 403
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute(
+        """SELECT c.id, c.label, c.confidence, c.checked_at, c.input_type, u.username
+           FROM checks c
+           JOIN users u ON u.id = c.user_id
+           ORDER BY c.checked_at DESC
+           LIMIT 100"""
+    )
+    checks = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    for c in checks:
+        c['checked_at'] = c['checked_at'].isoformat()
+
+    return jsonify(checks)
+
+
+@app.route('/admin/users/<int:target_id>', methods=['DELETE'])
+@jwt_required()
+def admin_delete_user(target_id):
+    user_id = get_jwt_identity()
+    if not require_admin(user_id):
+        return jsonify({'error': 'Admin access required'}), 403
+
+    if str(target_id) == str(user_id):
+        return jsonify({'error': "You can't delete your own account here"}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM users WHERE id = %s", (target_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
 
     return jsonify({'success': True})
 
