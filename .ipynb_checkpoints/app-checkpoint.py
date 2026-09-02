@@ -40,6 +40,15 @@ def require_admin(user_id):
     conn.close()
     return user and user['role'] == 'admin'
 
+def require_super_admin(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT is_super_admin FROM users WHERE id = %s", (user_id,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+    return user and user['is_super_admin']
+
 
 def clean_text(text):
     text = str(text)
@@ -104,7 +113,12 @@ def login():
         return jsonify({'error': 'Invalid username or password'}), 401
 
     token = create_access_token(identity=str(user['id']))
-    return jsonify({'token': token, 'username': user['username'], 'role': user['role']})
+    return jsonify({
+        'token': token,
+        'username': user['username'],
+        'role': user['role'],
+        'is_super_admin': user.get('is_super_admin', False)
+    })
 
 
 @app.route('/predict', methods=['POST'])
@@ -240,7 +254,7 @@ def admin_list_users():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute(
-        """SELECT u.id, u.username, u.role, u.created_at,
+        """SELECT u.id, u.username, u.role, u.is_super_admin, u.created_at,
                   COUNT(c.id) as check_count
            FROM users u
            LEFT JOIN checks c ON c.user_id = u.id
@@ -294,8 +308,40 @@ def admin_delete_user(target_id):
         return jsonify({'error': "You can't delete your own account here"}), 400
 
     conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT is_super_admin FROM users WHERE id = %s", (target_id,))
+    target = cur.fetchone()
+    if target and target['is_super_admin']:
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'This account cannot be removed'}), 403
+
     cur = conn.cursor()
     cur.execute("DELETE FROM users WHERE id = %s", (target_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return jsonify({'success': True})
+
+@app.route('/admin/users/<int:target_id>/role', methods=['PATCH'])
+@jwt_required()
+def admin_update_role(target_id):
+    user_id = get_jwt_identity()
+    if not require_super_admin(user_id):
+        return jsonify({'error': 'Super admin access required'}), 403
+
+    data = request.get_json()
+    new_role = data.get('role')
+    if new_role not in ('user', 'admin'):
+        return jsonify({'error': 'Invalid role'}), 400
+
+    if str(target_id) == str(user_id):
+        return jsonify({'error': "You can't change your own role here"}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET role = %s WHERE id = %s", (new_role, target_id))
     conn.commit()
     cur.close()
     conn.close()
