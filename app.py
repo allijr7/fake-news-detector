@@ -8,9 +8,19 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from newspaper import Article
 
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
 app = Flask(__name__)
 CORS(app)
 bcrypt = Bcrypt(app)
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://"
+)
 
 import os
 
@@ -66,6 +76,7 @@ def scrape_url(url):
 
 
 @app.route('/register', methods=['POST'])
+@limiter.limit("5 per minute")
 def register():
     data = request.get_json()
     username = data.get('username', '').strip()
@@ -97,6 +108,7 @@ def register():
 
 
 @app.route('/login', methods=['POST'])
+@limiter.limit("5 per minute")
 def login():
     data = request.get_json()
     username = data.get('username', '').strip()
@@ -123,6 +135,7 @@ def login():
 
 @app.route('/predict', methods=['POST'])
 @jwt_required()
+@limiter.limit("10 per minute")
 def predict():
     user_id = get_jwt_identity()
     data = request.get_json()
