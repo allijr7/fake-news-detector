@@ -37,6 +37,20 @@ DB_CONFIG = {
     'password': os.environ.get('DB_PASSWORD', 'allijr10'),
     'port': int(os.environ.get('DB_PORT', 5432))
 }
+
+import re as re_module
+
+def validate_password(password):
+    if len(password) < 8:
+        return "Password must be at least 8 characters"
+    if not re_module.search(r'[A-Z]', password):
+        return "Password must include at least one uppercase letter"
+    if not re_module.search(r'[0-9]', password):
+        return "Password must include at least one number"
+    if not re_module.search(r'[!@#$%^&*(),.?":{}|<>_\-+=]', password):
+        return "Password must include at least one special character"
+    return None
+    
 def get_db_connection():
     sslmode = 'require' if DB_CONFIG['host'] != 'localhost' else 'prefer'
     return psycopg2.connect(**DB_CONFIG, sslmode=sslmode)
@@ -84,6 +98,10 @@ def register():
 
     if not username or not password:
         return jsonify({'error': 'Username and password are required'}), 400
+
+    password_error = validate_password(password)
+    if password_error:
+        return jsonify({'error': password_error}), 400
 
     password_hash = bcrypt.generate_password_hash(password).decode('utf-8')
 
@@ -355,6 +373,39 @@ def admin_update_role(target_id):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("UPDATE users SET role = %s WHERE id = %s", (new_role, target_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return jsonify({'success': True})
+
+@app.route('/change-password', methods=['POST'])
+@jwt_required()
+def change_password():
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    current_password = data.get('current_password', '')
+    new_password = data.get('new_password', '')
+
+    if not current_password or not new_password:
+        return jsonify({'error': 'Both current and new password are required'}), 400
+    password_error = validate_password(new_password)
+    if password_error:
+        return jsonify({'error': password_error}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT password_hash FROM users WHERE id = %s", (user_id,))
+    user = cur.fetchone()
+
+    if not user or not bcrypt.check_password_hash(user['password_hash'], current_password):
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'Current password is incorrect'}), 401
+
+    new_hash = bcrypt.generate_password_hash(new_password).decode('utf-8')
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET password_hash = %s WHERE id = %s", (new_hash, user_id))
     conn.commit()
     cur.close()
     conn.close()
