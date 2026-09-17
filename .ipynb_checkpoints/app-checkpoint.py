@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_bcrypt import Bcrypt
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from datetime import datetime
 import joblib
 import re
 import psycopg2
@@ -49,6 +50,11 @@ def validate_password(password):
         return "Password must include at least one number"
     if not re_module.search(r'[!@#$%^&*(),.?":{}|<>_\-+=]', password):
         return "Password must include at least one special character"
+    return None
+    
+def validate_username(username):
+    if not re_module.match(r'^[A-Za-z0-9_.]{3,20}$', username):
+        return "Username must be 3-20 characters (letters, numbers, underscores, dots only)"
     return None
     
 def get_db_connection():
@@ -99,6 +105,14 @@ def register():
     if not username or not password:
         return jsonify({'error': 'Username and password are required'}), 400
 
+    username_error = validate_username(username)
+    if username_error:
+        return jsonify({'error': username_error}), 400
+
+    password_error = validate_password(password)
+    if password_error:
+        return jsonify({'error': password_error}), 400
+
     password_error = validate_password(password)
     if password_error:
         return jsonify({'error': password_error}), 400
@@ -122,7 +136,7 @@ def register():
         conn.close()
 
     token = create_access_token(identity=str(user_id))
-    return jsonify({'token': token, 'username': username})
+    return jsonify({'token': token, 'username': username, 'role': 'user', 'is_super_admin': False, 'name': None})
 
 
 @app.route('/login', methods=['POST'])
@@ -136,65 +150,66 @@ def login():
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT * FROM users WHERE username = %s", (username,))
     user = cur.fetchone()
+
+    if not user:
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'Invalid username or password'}), 401
+
+    if user['is_suspended']:
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'This account has been suspended. Contact an administrator.'}), 403
+
+    if user['locked_until'] and user['locked_until'] > datetime.utcnow():
+        remaining = int((user['locked_until'] - datetime.utcnow()).total_seconds() / 60) + 1
+        cur.close()
+        conn.close()
+        return jsonify({'error': f'Account locked due to failed attempts. Try again in {remaining} minute(s).'}), 403
+
+    if not bcrypt.check_password_hash(user['password_hash'], password):
+        new_attempts = user['failed_login_attempts'] + 1
+        cur2 = conn.cursor()
+        if new_attempts >= 5:
+            from datetime import timedelta
+            lock_time = datetime.utcnow() + timedelta(minutes=15)
+            cur2.execute(
+                "UPDATE users SET failed_login_attempts = %s, locked_until = %s WHERE id = %s",
+                (new_attempts, lock_time, user['id'])
+            )
+            conn.commit()
+            cur2.close()
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Too many failed attempts. Account locked for 15 minutes.'}), 403
+        else:
+            cur2.execute(
+                "UPDATE users SET failed_login_attempts = %s WHERE id = %s",
+                (new_attempts, user['id'])
+            )
+            conn.commit()
+            cur2.close()
+            cur.close()
+            conn.close()
+            remaining_tries = 5 - new_attempts
+            return jsonify({'error': f'Invalid username or password. {remaining_tries} attempt(s) remaining.'}), 401
+
+    # Successful login — reset failed attempts
+    cur2 = conn.cursor()
+    cur2.execute("UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = %s", (user['id'],))
+    conn.commit()
+    cur2.close()
     cur.close()
     conn.close()
-
-    if not user or not bcrypt.check_password_hash(user['password_hash'], password):
-        return jsonify({'error': 'Invalid username or password'}), 401
 
     token = create_access_token(identity=str(user['id']))
     return jsonify({
         'token': token,
         'username': user['username'],
         'role': user['role'],
-        'is_super_admin': user.get('is_super_admin', False)
+        'is_super_admin': user.get('is_super_admin', False),
+        'name': user.get('name')
     })
-
-def run_prediction(text):
-    cleaned = clean_text(text)
-    vectorized = vectorizer.transform([cleaned])
-    prediction = model.predict(vectorized)[0]
-    probability = model.predict_proba(vectorized)[0]
-
-    confidence = float(max(probability))
-    confidence_pct = round(confidence * 100, 2)
-
-    if confidence_pct < 60:
-        label = 'Uncertain'
-    else:
-        label = 'Real' if prediction == 1 else 'Fake'
-
-    feature_names = vectorizer.get_feature_names_out()
-    coefficients = model.coef_[0]
-    nonzero_indices = vectorized.nonzero()[1]
-    word_scores = [(feature_names[i], coefficients[i]) for i in nonzero_indices]
-
-    if prediction == 1:
-        word_scores.sort(key=lambda x: x[1], reverse=True)
-    else:
-        word_scores.sort(key=lambda x: x[1])
-
-    top_words = [{'word': w, 'weight': round(float(s), 3)} for w, s in word_scores[:8]]
-
-    return {
-        'label': label,
-        'confidence': confidence_pct,
-        'extracted_text_preview': cleaned[:300],
-        'top_words': top_words
-    }
-
-
-def save_check(user_id, input_type, input_source, result):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """INSERT INTO checks (user_id, input_type, input_source, text_preview, label, confidence)
-           VALUES (%s, %s, %s, %s, %s, %s)""",
-        (user_id, input_type, input_source, result['extracted_text_preview'], result['label'], result['confidence'])
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
     
 @app.route('/predict', methods=['POST'])
 @jwt_required()
@@ -309,7 +324,7 @@ def admin_list_users():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute(
-        """SELECT u.id, u.username, u.role, u.is_super_admin, u.created_at,
+        """SELECT u.id, u.username, u.role, u.is_super_admin, u.is_suspended, u.created_at,
                   COUNT(c.id) as check_count
            FROM users u
            LEFT JOIN checks c ON c.user_id = u.id
@@ -443,7 +458,57 @@ def admin_analytics():
         'total_users': total_users,
         'total_checks': total_checks
     })
-    
+
+@app.route('/admin/users/<int:target_id>/suspend', methods=['PATCH'])
+@jwt_required()
+def admin_toggle_suspend(target_id):
+    user_id = get_jwt_identity()
+    if not require_admin(user_id):
+        return jsonify({'error': 'Admin access required'}), 403
+
+    if str(target_id) == str(user_id):
+        return jsonify({'error': "You can't suspend your own account"}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT username, is_suspended, is_super_admin FROM users WHERE id = %s", (target_id,))
+    target = cur.fetchone()
+
+    if not target:
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'User not found'}), 404
+
+    if target['is_super_admin']:
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'This account cannot be suspended'}), 403
+
+    new_status = not target['is_suspended']
+    cur2 = conn.cursor()
+    cur2.execute("UPDATE users SET is_suspended = %s WHERE id = %s", (new_status, target_id))
+    conn.commit()
+    cur2.close()
+
+    # Log this action
+    actor_cur = conn.cursor(cursor_factory=RealDictCursor)
+    actor_cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+    actor = actor_cur.fetchone()
+    actor_cur.close()
+
+    log_cur = conn.cursor()
+    action = 'suspend' if new_status else 'reactivate'
+    log_cur.execute(
+        "INSERT INTO admin_audit_log (actor_id, action, target_username, details) VALUES (%s, %s, %s, %s)",
+        (user_id, action, target['username'], f"{actor['username']} {action}ed {target['username']}")
+    )
+    conn.commit()
+    log_cur.close()
+    cur.close()
+    conn.close()
+
+    return jsonify({'success': True, 'is_suspended': new_status})
+
 @app.route('/change-password', methods=['POST'])
 @jwt_required()
 def change_password():
@@ -455,8 +520,6 @@ def change_password():
     if not current_password or not new_password:
         return jsonify({'error': 'Both current and new password are required'}), 400
     password_error = validate_password(new_password)
-    if password_error:
-        return jsonify({'error': password_error}), 400
 
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -476,6 +539,89 @@ def change_password():
     conn.close()
 
     return jsonify({'success': True})
+
+@app.route('/change-name', methods=['POST'])
+@jwt_required()
+def change_name():
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    new_name = (data.get('name') or '').strip()
+
+    if len(new_name) > 50:
+        return jsonify({'error': 'Name must be 50 characters or fewer'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET name = %s WHERE id = %s", (new_name or None, user_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return jsonify({'success': True, 'name': new_name})
+
+
+@app.route('/change-username', methods=['POST'])
+@jwt_required()
+def change_username():
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    new_username = (data.get('username') or '').strip()
+
+    username_error = validate_username(new_username)
+    if username_error:
+        return jsonify({'error': username_error}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT username, username_changed_at FROM users WHERE id = %s", (user_id,))
+    user = cur.fetchone()
+
+    if user['username_changed_at']:
+        days_since = (datetime.utcnow() - user['username_changed_at']).days
+        if days_since < 14:
+            cur.close()
+            conn.close()
+            return jsonify({'error': f'You can change your username again in {14 - days_since} day(s)'}), 400
+
+    if new_username == user['username']:
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'That is already your username'}), 400
+
+    try:
+        cur2 = conn.cursor()
+        cur2.execute(
+            "UPDATE users SET username = %s, username_changed_at = NOW() WHERE id = %s",
+            (new_username, user_id)
+        )
+        conn.commit()
+        cur2.close()
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'Username already taken'}), 409
+
+    cur.close()
+    conn.close()
+    return jsonify({'success': True, 'username': new_username})
+
+@app.route('/check-username', methods=['GET'])
+def check_username():
+    username = request.args.get('username', '').strip()
+
+    format_error = validate_username(username)
+    if format_error:
+        return jsonify({'available': False, 'error': format_error})
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT id FROM users WHERE username = %s", (username,))
+    exists = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    return jsonify({'available': not exists})
 
 
 if __name__ == '__main__':
