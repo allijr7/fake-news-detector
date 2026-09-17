@@ -150,7 +150,52 @@ def login():
         'is_super_admin': user.get('is_super_admin', False)
     })
 
+def run_prediction(text):
+    cleaned = clean_text(text)
+    vectorized = vectorizer.transform([cleaned])
+    prediction = model.predict(vectorized)[0]
+    probability = model.predict_proba(vectorized)[0]
 
+    confidence = float(max(probability))
+    confidence_pct = round(confidence * 100, 2)
+
+    if confidence_pct < 60:
+        label = 'Uncertain'
+    else:
+        label = 'Real' if prediction == 1 else 'Fake'
+
+    feature_names = vectorizer.get_feature_names_out()
+    coefficients = model.coef_[0]
+    nonzero_indices = vectorized.nonzero()[1]
+    word_scores = [(feature_names[i], coefficients[i]) for i in nonzero_indices]
+
+    if prediction == 1:
+        word_scores.sort(key=lambda x: x[1], reverse=True)
+    else:
+        word_scores.sort(key=lambda x: x[1])
+
+    top_words = [{'word': w, 'weight': round(float(s), 3)} for w, s in word_scores[:8]]
+
+    return {
+        'label': label,
+        'confidence': confidence_pct,
+        'extracted_text_preview': cleaned[:300],
+        'top_words': top_words
+    }
+
+
+def save_check(user_id, input_type, input_source, result):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO checks (user_id, input_type, input_source, text_preview, label, confidence)
+           VALUES (%s, %s, %s, %s, %s, %s)""",
+        (user_id, input_type, input_source, result['extracted_text_preview'], result['label'], result['confidence'])
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    
 @app.route('/predict', methods=['POST'])
 @jwt_required()
 @limiter.limit("10 per minute")
@@ -175,62 +220,41 @@ def predict():
     else:
         return jsonify({'error': 'Provide either text or url'}), 400
 
-    cleaned = clean_text(text)
-    vectorized = vectorizer.transform([cleaned])
-    prediction = model.predict(vectorized)[0]
-    probability = model.predict_proba(vectorized)[0]
-
-    confidence = float(max(probability))
-    confidence_pct = round(confidence * 100, 2)
-
-    if confidence_pct < 60:
-        label = 'Uncertain'
-    else:
-        label = 'Real' if prediction == 1 else 'Fake'
-
-    feature_names = vectorizer.get_feature_names_out()
-    coefficients = model.coef_[0]
-
-    nonzero_indices = vectorized.nonzero()[1]
-    word_scores = [(feature_names[i], coefficients[i]) for i in nonzero_indices]
-
-    if prediction == 1:
-        word_scores.sort(key=lambda x: x[1], reverse=True)
-    else:
-        word_scores.sort(key=lambda x: x[1])
-
-    top_words = [
-        {'word': w, 'weight': round(float(s), 3)}
-        for w, s in word_scores[:8]
-    ]
-
-    result = {
-        'label': label,
-        'confidence': confidence_pct,
-        'extracted_text_preview': cleaned[:300],
-        'top_words': top_words
-    }
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """INSERT INTO checks (user_id, input_type, input_source, text_preview, label, confidence)
-           VALUES (%s, %s, %s, %s, %s, %s)""",
-        (
-            user_id,
-            'url' if 'url' in data and data['url'] else 'text',
-            data.get('url'),
-            result['extracted_text_preview'],
-            result['label'],
-            result['confidence']
-        )
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    result = run_prediction(text)
+    save_check(user_id, 'url' if 'url' in data and data['url'] else 'text', data.get('url'), result)
 
     return jsonify(result)
 
+@app.route('/predict-batch', methods=['POST'])
+@jwt_required()
+@limiter.limit("3 per minute")
+def predict_batch():
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    urls = data.get('urls', [])
+
+    if not urls or not isinstance(urls, list):
+        return jsonify({'error': 'Provide a list of URLs'}), 400
+    if len(urls) > 10:
+        return jsonify({'error': 'Maximum 10 URLs per batch'}), 400
+
+    results = []
+    for url in urls:
+        url = url.strip()
+        if not url:
+            continue
+        try:
+            text = scrape_url(url)
+            if len(text.strip()) < 200:
+                results.append({'url': url, 'error': 'Could not extract enough article text'})
+                continue
+            result = run_prediction(text)
+            save_check(user_id, 'url', url, result)
+            results.append({'url': url, **result})
+        except Exception as e:
+            results.append({'url': url, 'error': f'Could not fetch article: {str(e)}'})
+
+    return jsonify({'results': results})
 
 @app.route('/history', methods=['GET'])
 @jwt_required()
