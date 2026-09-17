@@ -403,6 +403,47 @@ def admin_update_role(target_id):
 
     return jsonify({'success': True})
 
+@app.route('/admin/analytics', methods=['GET'])
+@jwt_required()
+def admin_analytics():
+    user_id = get_jwt_identity()
+    if not require_admin(user_id):
+        return jsonify({'error': 'Admin access required'}), 403
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    cur.execute(
+        """SELECT DATE(checked_at) as day, COUNT(*) as count
+           FROM checks
+           WHERE checked_at >= NOW() - INTERVAL '14 days'
+           GROUP BY DATE(checked_at)
+           ORDER BY day"""
+    )
+    daily = cur.fetchall()
+
+    cur.execute("SELECT label, COUNT(*) as count FROM checks GROUP BY label")
+    by_label = cur.fetchall()
+
+    cur.execute("SELECT COUNT(*) as total_users FROM users")
+    total_users = cur.fetchone()['total_users']
+
+    cur.execute("SELECT COUNT(*) as total_checks FROM checks")
+    total_checks = cur.fetchone()['total_checks']
+
+    cur.close()
+    conn.close()
+
+    for d in daily:
+        d['day'] = d['day'].isoformat()
+
+    return jsonify({
+        'daily': daily,
+        'by_label': by_label,
+        'total_users': total_users,
+        'total_checks': total_checks
+    })
+    
 @app.route('/change-password', methods=['POST'])
 @jwt_required()
 def change_password():
